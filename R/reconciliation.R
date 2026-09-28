@@ -35,10 +35,35 @@ reconcile.mdl_df <- function(.data, ...){
 #' this is not yet tested for beyond the series length).
 #' 
 #' @param models A column of models in a mable.
-#' @param method The reconciliation method to use.
+#' @param method The reconciliation method to use. `"mint_ridge"` is the
+#'   MinT-Ridge estimator, which replaces the weight
+#'   matrix `W` by `W + lambda*I` and selects the penalty `lambda` by
+#'   `k`-fold cross-validation on the in-sample one-step forecasts. A penalty
+#'   of `0` gives `"mint_cov"` and an unbounded penalty gives `"ols"`.
+#'   Bottom-up is *not* an endpoint of this path — it corresponds to a singular
+#'   reweighting that adding `lambda*I` moves away from — so use
+#'   [`bottom_up()`] for that. The remaining arguments are ignored unless
+#'   `method = "mint_ridge"`.
 #' @param sparse If TRUE, the reconciliation will be computed using sparse 
 #' matrix algebra? By default, sparse matrices will be used if the MatrixM 
 #' package is installed.
+#' @param k Number of cross-validation folds used to select the MinT-Ridge
+#'   penalty. Must be at least 2.
+#' @param window Whether the cross-validation training window expands
+#'   (`"expanding"`, using all observations from the start of the series) or
+#'   slides (`"rolling"`, using only the `initial` most recent observations
+#'   preceding each validation block).
+#' @param initial Number of in-sample observations reserved as the minimum
+#'   cross-validation training window. The remaining observations are split
+#'   into `k` contiguous validation blocks. If `NULL` (the default) this is
+#'   `ceiling(T/2)`, capped so that at least `k` validation observations remain.
+#' @param grid Penalty grid for MinT-Ridge, in units of
+#'   `mean(diag(W))`. If `NULL` (the default) a `glmnet`-style data-driven grid
+#'   is used: `lambda_max` is the largest eigenvalue of `W/mean(diag(W))`, and
+#'   100 values are spaced geometrically from `lambda_max` down to
+#'   `1e-4 * lambda_max` (`1e-2 * lambda_max` when the number of observations
+#'   is not greater than the number of series), together with an exact `0` so
+#'   that the unpenalised estimator remains selectable.
 #' 
 #' @seealso 
 #' [`reconcile()`], [`aggregate_key()`]
@@ -47,13 +72,37 @@ reconcile.mdl_df <- function(.data, ...){
 #' Wickramasuriya, S. L., Athanasopoulos, G., & Hyndman, R. J. (2019). Optimal forecast reconciliation for hierarchical and grouped time series through trace minimization. Journal of the American Statistical Association, 1-45. https://doi.org/10.1080/01621459.2018.1448825 
 #' 
 #' @export
-min_trace <- function(models, method = c("wls_var", "ols", "wls_struct", "mint_cov", "mint_shrink"),
-                 sparse = NULL){
+min_trace <- function(models, method = c("wls_var", "ols", "wls_struct", "mint_cov", "mint_shrink", "mint_ridge"),
+                 sparse = NULL,
+                 k = 5L,
+                 window = c("expanding", "rolling"),
+                 initial = NULL,
+                 grid = NULL){
   if(is.null(sparse)){
     sparse <- requireNamespace("Matrix", quietly = TRUE)
   }
+  method <- match.arg(method)
+  window <- match.arg(window)
+  if(length(k) != 1 || !is.numeric(k) || is.na(k) || k < 2 || k != round(k)){
+    cli::cli_abort(c("{.arg k} must be a single number of at least 2.", "i" = "{.arg k} is {k}."))
+  }
+  k <- as.integer(k)
+  if(!is.null(grid)){
+    if(!is.numeric(grid) || length(grid) == 0 || anyNA(grid) || any(grid < 0)){
+      cli::cli_abort("{.arg grid} must be a non-empty vector of non-negative, non-missing numbers.")
+    }
+    grid <- sort(unique(as.numeric(grid)))
+  }
+  if(!("mint_ridge" %in% method) &&
+     (k != 5L || window != "expanding" || !is.null(initial) || !is.null(grid))){
+    cli::cli_warn(c(
+      "Cross-validation arguments are only used by {.code method = \"mint_ridge\"}.",
+      "i" = "They are being ignored for {.code method = \"{method}\"}."
+    ))
+  }
   structure(models, class = c("lst_mint_mdl", "mdl_lst", "list"),
-            method = match.arg(method), sparse = sparse)
+            method = method, sparse = sparse, k = k, window = window,
+            initial = initial, grid = grid)
 }
 
 #' @export
@@ -82,13 +131,7 @@ forecast.lst_mint_mdl <- function(object, key_data,
   }
   
   # Compute weights (sample covariance)
-  res <- map(object, function(x, ...) residuals(x, ...), type = "response")
-  if(length(unique(map_dbl(res, nrow))) > 1){
-    # Join residuals by index #199
-    res <- unname(as.matrix(reduce(res, full_join, by = index_var(res[[1]]))[,-1]))
-  } else {
-    res <- matrix(invoke(c, map(res, `[[`, 2)), ncol = length(object))
-  }
+  res <- stack_series(map(object, function(x, ...) residuals(x, ...), type = "response"))
   
   # Construct S matrix - ??GA: have moved this here as I need it for Structural scaling
   agg_data <- build_key_data_smat(key_data)
@@ -120,14 +163,24 @@ forecast.lst_mint_mdl <- function(object, key_data,
     lambda <- sum(v)/sum(d)
     lambda <- max(min(lambda, 1), 0)
     W <- lambda * tar + (1 - lambda) * covm
+  } else if (method == "mint_ridge"){
+    # MinT-Ridge: W + alpha*I with alpha chosen by k-fold CV on h=1 forecasts
+    W <- mint_ridge_weights(covm, object, agg_data,
+                            k = object%@%"k",
+                            window = object%@%"window",
+                            initial = object%@%"initial",
+                            grid = object%@%"grid")
   } else {
     abort("Unknown reconciliation method")
   }
   
   # Check positive definiteness of weights
-  eigenvalues <- eigen(W, only.values = TRUE)[["values"]]
-  if (any(eigenvalues < 1e-8)) {
-    abort("min_trace needs covariance matrix to be positive definite.", call. = FALSE)
+  if (method != "mint_ridge"){
+    # mint_ridge guarantees W + alpha*I is PD by construction (alpha >= 0)
+    eigenvalues <- eigen(W, only.values = TRUE)[["values"]]
+    if (any(eigenvalues < 1e-8)) {
+      abort("min_trace needs covariance matrix to be positive definite.", call. = FALSE)
+    }
   }
   
   # Reconciliation matrices
@@ -156,13 +209,175 @@ forecast.lst_mint_mdl <- function(object, key_data,
     }
   }
   else {
-    S <- matrix(0L, nrow = length(agg_data$agg), ncol = max(vec_c(!!!agg_data$agg)))
-    S[length(agg_data$agg)*(vec_c(!!!agg_data$agg)-1) + rep(seq_along(agg_data$agg), lengths(agg_data$agg))] <- 1L
+    S <- build_smat_dense(agg_data)
     R <- t(S)%*%solve(W)
     P <- solve(R%*%S)%*%R
   }
   
   reconcile_fbl_list(fc, S, P, W, point_forecast = point_method)
+}
+
+# Dense summation matrix from the aggregation structure
+build_smat_dense <- function(agg_data){
+  S <- matrix(0L, nrow = length(agg_data$agg), ncol = max(vec_c(!!!agg_data$agg)))
+  S[length(agg_data$agg)*(vec_c(!!!agg_data$agg)-1) + rep(seq_along(agg_data$agg), lengths(agg_data$agg))] <- 1L
+  S
+}
+
+# Stack a list of per-series tsibbles into a time x series matrix
+# Used for the residual, response and fitted values of a reconciliation model
+stack_series <- function(x){
+  if(length(unique(map_dbl(x, nrow))) > 1){
+    # Join by index #199
+    unname(as.matrix(reduce(x, full_join, by = index_var(x[[1]]))[,-1]))
+  } else {
+    matrix(invoke(c, map(x, `[[`, 2)), ncol = length(x))
+  }
+}
+
+# glmnet-style data-driven penalty grid for MinT-Ridge.
+# lambda_max is the largest eigenvalue of the scale-free W (= W / mean(diag(W))),
+# the point at which alpha*I becomes commensurate with the data term and beyond
+# which (W + alpha*I)^-1 is indistinguishable from alpha^-1*I, i.e. the estimator
+# has converged to OLS. Note this is *not* bottom-up: the ridge path runs from
+# MinT with the sample covariance (alpha = 0) to OLS (alpha = inf), and OLS is a
+# different operator from bottom-up (max|P_ols - P_bu| = 1/3 for a 2-level
+# hierarchy). Neither endpoint is bottom-up, which is not reachable from this
+# family at all: it is the W -> diag(0,...,0,inf,...,inf) limit.
+mint_ridge_grid <- function(W, Tn, n_series){
+  lambda_max <- max(eigen(W, symmetric = TRUE, only.values = TRUE)[["values"]])
+  # glmnet uses a wider floor when the problem is over-parameterised (T <= n)
+  lambda_min <- lambda_max * if (Tn > n_series) 1e-4 else 1e-2
+  c(0, exp(seq(log(lambda_min), log(lambda_max), length.out = 100)))
+}
+
+# Build the k cross-validation folds. `initial` is the minimum training window:
+# the first `initial` observations are always training, and the remaining
+# T - initial observations are split into k contiguous validation blocks.
+# Fold j trains on rows ending at `cuts[j]` and validates on `cuts[j] + 1:cuts[j+1]`,
+# so training and validation never overlap.
+mint_ridge_folds <- function(Tn, k, window, initial){
+  remaining <- Tn - initial
+  cuts <- initial + as.integer(round(seq(0, remaining, length.out = k + 1L)))
+  lapply(seq_len(k), function(j){
+    list(
+      train = if (window == "expanding") seq_len(cuts[j])
+              else seq.int(max(cuts[j] + 1L - initial, 1L), cuts[j]),
+      valid = seq.int(cuts[j] + 1L, cuts[j + 1L])
+    )
+  })
+}
+
+# MinT-Ridge weight matrix: W/s + alpha*I, with alpha selected by k-fold CV.
+# The loss is the validation-period reconciled MSE over all series, using
+# in-sample one-step (h=1) fitted values so that the covariance estimator and
+# the tuning criterion are on the same footing.
+mint_ridge_weights <- function(covm, object, agg_data, k, window, initial, grid){
+  n_series <- nrow(covm)
+  S <- build_smat_dense(agg_data)
+  res <- stack_series(map(object, function(x, ...) residuals(x, ...), type = "response"))
+  y   <- stack_series(map(object, response))
+  fit <- stack_series(map(object, fitted))
+  keep <- stats::complete.cases(res) & stats::complete.cases(y) & stats::complete.cases(fit)
+  res <- res[keep, , drop = FALSE]
+  y <- y[keep, , drop = FALSE]
+  fit <- fit[keep, , drop = FALSE]
+  Tn <- nrow(res)
+  if (Tn < k + 1L){
+    cli::cli_abort(c(
+      "Not enough complete in-sample observations for MinT-Ridge cross-validation.",
+      "i" = "{Tn} complete observation{?s} are available, but at least {k + 1L} are needed for {k} folds."
+    ))
+  }
+  
+  # Scale-free parameterisation A = W/s + alpha*I. Required: the direct
+  # W + lambda*I is computationally singular for large lambda, and the scale
+  # factor makes alpha invariant to the units of W.
+  s <- mean(diag(covm))
+  if (!is.finite(s) || s <= 0){
+    cli::cli_abort(c(
+      "MinT-Ridge needs a positive mean residual variance to scale the penalty.",
+      "i" = "The mean diagonal of the sample covariance matrix is {s}."
+    ))
+  }
+  W <- covm / s
+  
+  if (is.null(grid)){
+    grid <- mint_ridge_grid(W, Tn, n_series)
+  }
+  if (is.null(initial)){
+    initial <- min(max(ceiling(Tn / 2), 1L), Tn - k)
+  }
+  if (length(initial) != 1 || !is.numeric(initial) || is.na(initial) ||
+      initial < 1 || initial + k > Tn){
+    cli::cli_abort(c(
+      "{.arg initial} must leave room for {k} cross-validation folds.",
+      "i" = "There are {Tn} complete observations, so {.arg initial} must be between 1 and {Tn - k}."
+    ))
+  }
+  initial <- as.integer(initial)
+  folds <- mint_ridge_folds(Tn, k, window, initial)
+  
+  # alpha = 0 reproduces mint_cov, which is only defined for a positive definite
+  # W. Drop it (with a warning) so that CV can pick a stabilising alpha instead.
+  drop_zero <- min(eigen(W, symmetric = TRUE, only.values = TRUE)[["values"]]) <= 1e-8
+  if (drop_zero && any(grid == 0)){
+    cli::cli_warn(c(
+      "The sample covariance matrix is not positive definite.",
+      "i" = "Dropping {.code alpha = 0} from the penalty grid; cross-validation will select a stabilising penalty."
+    ))
+    grid <- grid[grid > 0]
+  }
+  
+  # Per fold: eigendecompose the training covariance once, then each alpha costs
+  # a single m x m solve via (W + alpha*I)^-1 = V diag(1/(d + alpha)) V'
+  loss <- rep(0, length(grid))
+  n_folds <- 0L
+  for (fold in folds){
+    tr <- fold$train
+    W_tr <- crossprod(res[tr, , drop = FALSE]) / length(tr)
+    s_tr <- mean(diag(W_tr))
+    if (!is.finite(s_tr) || s_tr <= 0) next
+    n_folds <- n_folds + 1L
+    eig <- eigen(W_tr, symmetric = TRUE)
+    d <- eig$values
+    Q <- t(eig$vectors) %*% S
+    y_va <- t(y[fold$valid, , drop = FALSE])
+    f_va <- t(fit[fold$valid, , drop = FALSE])
+    n_va <- length(fold$valid)
+    for (i in seq_along(grid)){
+      alpha <- grid[i]
+      denom <- d / s_tr + alpha
+      if (any(!is.finite(denom)) || any(denom <= 0)){
+        loss[i] <- loss[i] + Inf
+        next
+      }
+      D <- diag(1 / denom, nrow = length(d))
+      QtD <- t(Q) %*% D
+      B <- QtD %*% Q
+      P <- tryCatch(solve(B) %*% QtD, error = function(e) NULL)
+      if (is.null(P)){
+        loss[i] <- loss[i] + Inf
+      } else {
+        loss[i] <- loss[i] + sum((y_va - S %*% P %*% f_va)^2) / n_va
+      }
+    }
+  }
+  
+  if (n_folds == 0L){
+    cli::cli_abort("MinT-Ridge cross-validation failed: no fold had a usable residual covariance.")
+  }
+  finite <- is.finite(loss)
+  if (!any(finite)){
+    cli::cli_abort("MinT-Ridge cross-validation failed: no penalty in the grid produced a usable fit.")
+  }
+  best <- which.min(replace(loss, !finite, Inf))
+  alpha <- grid[best]
+  cli::cli_inform(c(
+    "i" = "MinT-Ridge: alpha = {.val {alpha}} selected by {k}-fold cross-validation ({window} window)."
+  ))
+  
+  W + alpha * diag(n_series)
 }
 
 #' Bottom up forecast reconciliation

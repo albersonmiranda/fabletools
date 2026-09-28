@@ -6,18 +6,51 @@
 \usage{
 min_trace(
   models,
-  method = c("wls_var", "ols", "wls_struct", "mint_cov", "mint_shrink"),
-  sparse = NULL
+  method = c("wls_var", "ols", "wls_struct", "mint_cov", "mint_shrink", "mint_ridge"),
+  sparse = NULL,
+  k = 5L,
+  window = c("expanding", "rolling"),
+  initial = NULL,
+  grid = NULL
 )
 }
 \arguments{
 \item{models}{A column of models in a mable.}
 
-\item{method}{The reconciliation method to use.}
+\item{method}{The reconciliation method to use. \code{"mint_ridge"} is the
+MinT-Ridge estimator, which replaces the weight
+matrix \code{W} by \code{W + lambda*I} and selects the penalty \code{lambda} by
+\code{k}-fold cross-validation on the in-sample one-step forecasts. A penalty
+of \code{0} gives \code{"mint_cov"} and an unbounded penalty gives \code{"ols"}.
+Bottom-up is \emph{not} an endpoint of this path — it corresponds to a singular
+reweighting that adding \code{lambda*I} moves away from — so use
+\code{\link[=bottom_up]{bottom_up()}} for that. The remaining arguments are ignored unless
+\code{method = "mint_ridge"}.}
 
 \item{sparse}{If TRUE, the reconciliation will be computed using sparse
 matrix algebra? By default, sparse matrices will be used if the MatrixM
 package is installed.}
+
+\item{k}{Number of cross-validation folds used to select the MinT-Ridge
+penalty. Must be at least 2.}
+
+\item{window}{Whether the cross-validation training window expands
+(\code{"expanding"}, using all observations from the start of the series) or
+slides (\code{"rolling"}, using only the \code{initial} most recent observations
+preceding each validation block).}
+
+\item{initial}{Number of in-sample observations reserved as the minimum
+cross-validation training window. The remaining observations are split
+into \code{k} contiguous validation blocks. If \code{NULL} (the default) this is
+\code{ceiling(T/2)}, capped so that at least \code{k} validation observations remain.}
+
+\item{grid}{Penalty grid for MinT-Ridge, in units of
+\code{mean(diag(W))}. If \code{NULL} (the default) a \code{glmnet}-style data-driven grid
+is used: \code{lambda_max} is the largest eigenvalue of \code{W/mean(diag(W))}, and
+100 values are spaced geometrically from \code{lambda_max} down to
+\code{1e-4 * lambda_max} (\code{1e-2 * lambda_max} when the number of observations
+is not greater than the number of series), together with an exact \code{0} so
+that the unpenalised estimator remains selectable.}
 }
 \description{
 Reconciles a hierarchy using the minimum trace combination method. The

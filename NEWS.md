@@ -26,6 +26,18 @@
 
 * Increased the minimum required version of distributional to 0.6.0 for upstream
   improvements to statistics on transformed distributions (#442).
+* `min_trace()` gains a new `method = "mint_ridge"`, the MinT-Ridge estimator. It
+  replaces the sample covariance `W` by `W + lambda*I` and selects the penalty
+  `lambda` by `k`-fold cross-validation on the in-sample one-step forecasts, so
+  it remains well defined when the sample covariance matrix is singular (for
+  example when there are more series than observations) and `mint_cov` is not.
+  The penalty grid is data driven: `lambda_max` is the largest eigenvalue of the
+  scale-free `W/mean(diag(W))` and 100 values are spaced geometrically down to
+  `1e-4 * lambda_max` (`1e-2 * lambda_max` when the number of observations does
+  not exceed the number of series), alongside an exact `0` so that the
+  unpenalised estimator remains selectable. The cross-validation is fully
+  deterministic, and the selected penalty is reported. `k`, `window`
+  (`"expanding"` or `"rolling"`), `initial` and `grid` control the search.
 
 # fabletools 0.8.0
 
